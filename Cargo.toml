@@ -1,11 +1,11 @@
 [package]
 name = "funksteckdose"
-version = "0.1.1-alpha0"
+version = "0.2.0-alpha0"
 authors = ["Felix Obenhuber <felix@obenhuber.de>"]
 description = "Utility for controlling wireless remote sockets via 433MHz radio transmitter"
 edition = "2018"
 readme = "README.md"
-keywords = ["433", "rc-switch", "raspberry", "pi", "wiringpi"]
+keywords = ["433", "rc-switch", "raspberry", "pi", "wiringpi", "embedded-hal"]
 documentation = "https://docs.rs/funksteckdose"
 homepage = "https://github.com/flxo/funksteckdose"
 repository = "https://github.com/flxo/funksteckdose"
@@ -25,10 +25,16 @@ path = "src/main.rs"
 doc = false 
 
 [dependencies]
-failure = "0.1.5"
-log = "0.4.6"
-structopt = "0.2.16"
-wiringpi = { version = "0.2.4", optional = true }
+embedded-hal = { version = "0.2", optional = true}
+failure = { version = "0.1.5", optional = true }
+log = { version = "0.4.6", optional = false }
+structopt = { version = "0.2.16", optional = true }
+
+[dependencies.wiringpi]
+version = "0.2.4"
+optional = true
 
 [features]
-default = []
+default = [ "std" ]
+std = [ "error-context", "structopt" ]
+error-context = [ "failure" ] # Enables richer error types - requires allocation.

@@ -1,3 +1,4 @@
+#![cfg_attr(not(feature = "std"), no_std)]
 /// Copyright © 2019 Felix Obenhuber
 ///
 /// Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -17,24 +18,76 @@
 /// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 /// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 /// SOFTWARE.
-
+use core::marker::PhantomData;
+use core::str;
 use error::Error;
-use log::debug;
-use std::marker::PhantomData;
-use std::str;
+
+#[cfg(all(not(feature = "std"), feature = "wiringpi"))]
+compile_error!("feature \"wiringpi\" requires feature \"std\"");
 
 /// Error
 pub mod error {
+    use core::fmt::Debug;
+
+    #[cfg(feature = "error-context")]
     use failure::Fail;
 
-    #[derive(Debug, Fail)]
+    #[derive(Debug)]
+    #[cfg_attr(feature = "error-context", derive(Fail))]
     pub enum Error {
-        #[fail(display = "invalid group identifier: {}", _0)]
-        InvalidGroup(String),
-        #[fail(display = "invalid device identifier: {}", _0)]
-        InvalidDevice(String),
-        #[fail(display = "invalid state: {}. Try on, off, 1, 0, true, false", _0)]
-        InvalidState(String),
+        #[cfg_attr(
+            feature = "error-context",
+            fail(display = "invalid group identifier: {}", _0)
+        )]
+        InvalidGroup(ErrorData),
+        #[cfg_attr(
+            feature = "error-context",
+            fail(display = "invalid device identifier: {}", _0)
+        )]
+        InvalidDevice(ErrorData),
+        #[cfg_attr(
+            feature = "error-context",
+            fail(display = "invalid state: {}. Try on, off, 1, 0, true, false", _0)
+        )]
+        InvalidState(ErrorData),
+        /// GpioError indicates failure setting gpio state during signal output
+        #[cfg_attr(feature = "error-context", fail(display = "gpio error"))]
+        GpioError,
+    }
+
+    /// ErrorData newtype wraps the error context.
+    /// ErrorData contains only empty unit type unless feature "error-context" is enabled.
+    #[cfg(feature = "error-context")]
+    pub struct ErrorData(String);
+
+    /// ErrorData newtype wraps the error context.
+    /// ErrorData contains only empty unit type unless feature "error-context" is enabled.
+    #[cfg(not(feature = "error-context"))]
+    pub struct ErrorData(());
+
+    impl From<&str> for ErrorData {
+        #[cfg(not(feature = "error-context"))]
+        fn from(_input: &str) -> Self {
+            ErrorData(()) // Discard the error context message
+        }
+
+        #[cfg(feature = "error-context")]
+        fn from(input: &str) -> Self {
+            ErrorData(input.to_owned()) // Allocate a string for the error context message
+        }
+    }
+
+    impl Debug for ErrorData {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            self.0.fmt(f)
+        }
+    }
+
+    #[cfg(feature = "error-context")]
+    impl core::fmt::Display for ErrorData {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            core::fmt::Display::fmt(&self.0, f)
+        }
     }
 }
 
@@ -101,16 +154,57 @@ pub enum Value {
     High,
 }
 
+// Converts a bit string (eg. "1000") into the tri-state binary representation.
+fn binary_string_to_tri_state<'a>(buf: &'a mut [u8], bits: impl Iterator<Item = char>) -> &'a [u8] {
+    let mut n = 0;
+    // write to buffer
+    bits.enumerate().for_each(|(i, c)| {
+        match c {
+            '0' => buf[i] = b'F',
+            '1' => buf[i] = b'0',
+            _ => unreachable!(),
+        }
+        n = i + 1;
+    });
+
+    // take subslice of only the written bytes
+    &buf[..n]
+}
+
+/// Converts the tri-state binary representation into a 64bit decimal code word.
+fn tri_state_to_decimal_code(code_word: &[u8]) -> u64 {
+    code_word.iter().fold(0u64, |mut code, c| {
+        code <<= 2u64;
+        match c {
+            b'0' => code |= 0b00,
+            b'F' => code |= 0b01,
+            b'1' => code |= 0b11,
+            _ => unreachable!(),
+        }
+        code
+    })
+}
+
 /// Encoding
 pub trait Encoding {
-    fn encode(group: &str, device: &Device, state: &State) -> Result<Vec<u8>, Error>;
+    fn encode<'a>(
+        buf: &'a mut [u8],
+        group: &str,
+        device: &Device,
+        state: &State,
+    ) -> Result<&'a [u8], Error>;
 }
 
 /// Encoding A - check [rc-switch](https://github.com/sui77/rc-switch/) for details
 pub struct EncodingA;
 
 impl Encoding for EncodingA {
-    fn encode(group: &str, device: &Device, state: &State) -> Result<Vec<u8>, Error> {
+    fn encode<'a>(
+        buf: &'a mut [u8],
+        group: &str,
+        device: &Device,
+        state: &State,
+    ) -> Result<&'a [u8], Error> {
         if group.len() != 5 || group.chars().any(|c| c != '0' && c != '1') {
             return Err(Error::InvalidGroup(group.into()));
         }
@@ -131,12 +225,7 @@ impl Encoding for EncodingA {
             State::Off => chars.chain("01".chars()),
         };
 
-        Ok(chars
-            .map(|c| match c {
-                '0' => b'F',
-                _ => b'0',
-            })
-            .collect())
+        Ok(binary_string_to_tri_state(buf, chars))
     }
 }
 
@@ -144,7 +233,12 @@ impl Encoding for EncodingA {
 pub struct EncodingB;
 
 impl Encoding for EncodingB {
-    fn encode(_group: &str, _device: &Device, _state: &State) -> Result<Vec<u8>, Error> {
+    fn encode<'a>(
+        _buf: &'a mut [u8],
+        _group: &str,
+        _device: &Device,
+        _state: &State,
+    ) -> Result<&'a [u8], Error> {
         unimplemented!()
     }
 }
@@ -153,34 +247,53 @@ impl Encoding for EncodingB {
 pub struct EncodingC;
 
 impl Encoding for EncodingC {
-    fn encode(_group: &str, _device: &Device, _state: &State) -> Result<Vec<u8>, Error> {
+    fn encode<'a>(
+        _buf: &'a mut [u8],
+        _group: &str,
+        _device: &Device,
+        _state: &State,
+    ) -> Result<&'a [u8], Error> {
         unimplemented!()
     }
 }
 
 /// Interface for GPIO control
 pub trait Pin {
-    fn set(&self, value: &Value) -> Result<(), Error>;
+    fn set(&mut self, value: &Value) -> Result<(), Error>;
+}
+
+/// Interface for delay to enable no_std
+pub trait Delay {
+    /// blocks the caller for `micros` microseconds
+    fn delay_microseconds(&mut self, us: u32) -> ();
 }
 
 /// Handle to a Funksteckdose system
 #[derive(Debug)]
-pub struct Funksteckdose<T: Pin, E: Encoding, P: Protocol> {
+pub struct Funksteckdose<T: Pin, D: Delay, E: Encoding, P: Protocol> {
     pin: T,
+    delay: D,
     repeat_transmit: usize,
     protocol: PhantomData<P>,
     encoding: PhantomData<E>,
 }
 
-impl<T: Pin, E: Encoding, P: Protocol> Funksteckdose<T, E, P> {
+impl<T: Pin, D: Delay, E: Encoding, P: Protocol> Funksteckdose<T, D, E, P> {
     /// Create a new instance with a given pin and default protocol
     /// ```
     /// type Funksteckdose = funksteckdose::Funksteckdose<WiringPiPin, EncodingA, Protocol1>;
     /// let pin = WiringPiPin::new(0);
     /// let d: Funksteckdose = Funksteckdose::new(pin);
     /// ```
-    pub fn new(pin: T) -> Funksteckdose<T, E, P> {
-        Self::with_repeat_transmit(pin, 10)
+    #[cfg(feature = "std")]
+    pub fn new(pin: T) -> Funksteckdose<T, impl Delay, E, P> {
+        Funksteckdose {
+            pin,
+            delay: StdDelay {},
+            repeat_transmit: 10,
+            protocol: PhantomData,
+            encoding: PhantomData,
+        }
     }
 
     /// Create a new instance with a given pin and transmit count
@@ -189,9 +302,26 @@ impl<T: Pin, E: Encoding, P: Protocol> Funksteckdose<T, E, P> {
     /// let pin = WiringPiPin::new(0);
     /// let d: Funksteckdose = Funksteckdose::with_repeat_transmit(pin, 5);
     /// ```
-    pub fn with_repeat_transmit(pin: T, repeat_transmit: usize) -> Funksteckdose<T, E, P> {
+    #[cfg(feature = "std")]
+    pub fn with_repeat_transmit(
+        pin: T,
+        repeat_transmit: usize,
+    ) -> Funksteckdose<T, impl Delay, E, P> {
         Funksteckdose {
             pin,
+            delay: StdDelay {},
+            repeat_transmit: repeat_transmit,
+            protocol: PhantomData,
+            encoding: PhantomData,
+        }
+    }
+
+    /// Create a new instance with given pin, delay implementation and transmit count.
+    /// Delay is implemented for [`embedded_hal::blocking::delay::DelayUs`]
+    pub fn new_with_delay(pin: T, delay: D, repeat_transmit: usize) -> Funksteckdose<T, D, E, P> {
+        Funksteckdose {
+            pin,
+            delay,
             repeat_transmit,
             protocol: PhantomData,
             encoding: PhantomData,
@@ -206,24 +336,27 @@ impl<T: Pin, E: Encoding, P: Protocol> Funksteckdose<T, E, P> {
     /// let d: Funksteckdose = Funksteckdose::with_repeat_transmit(pin, 5);
     /// d.send("10001", &Device::A, &State::On).expect("Failed to send");
     /// ```
-    pub fn send(&self, group: &str, device: &Device, state: &State) -> Result<(), Error> {
-        let code_word = E::encode(group, device, state)?;
-        self.send_tri_state(&code_word)
+    pub fn send(&mut self, group: &str, device: &Device, state: &State) -> Result<(), Error> {
+        // Get the code word for this group/device/state.
+        // This is equivalent of getCodeWordA/B/C/D in rc-switch for implemented devices.
+        let mut buf = [0; 64];
+        let code_word = { E::encode(&mut buf, group, device, state)? };
+
+        let code = tri_state_to_decimal_code(code_word);
+        self.send_decimal(code, code_word.len() * 2)?;
+        Ok(())
     }
 
-    fn send_tri_state(&self, code_word: &[u8]) -> Result<(), Error> {
-        let code = code_word.iter().fold(0u64, |mut code, c| {
-            code <<= 2u64;
-            match c {
-                b'0' => (),           // bit pattern 00
-                b'F' => code |= 1u64, // bit pattern 01
-                b'1' => code |= 3u64, // bit pattern 11
-                _ => unreachable!(),
-            }
-            code
-        });
-
-        // Transmit the first 'length' bits of the integer 'code'. The
+    /// send_decimal  is equivalent to one of the rc-switch send() implementations.
+    /// send_decimal sends rc-switch decimal code.
+    /// ```
+    /// type Funksteckdose = funksteckdose::Funksteckdose<WiringPiPin, EncodingA, Protocol1>;
+    /// let pin = WiringPiPin::new(0);
+    /// let d: Funksteckdose = Funksteckdose::with_repeat_transmit(pin, 5);
+    /// d.send_decimal(5526612, 24).expect("Failed to send");
+    /// ```
+    pub fn send_decimal(&mut self, decimal_code: u64, length: usize) -> Result<(), Error> {
+        // Transmit the first `length` bits of the `decimal_code`. The
         // bits are sent from MSB to LSB, i.e., first the bit at position length-1,
         // then the bit at position length-2, and so on, till finally the bit at position 0.
         let (first, second) = if P::values().inverted_signal {
@@ -231,13 +364,15 @@ impl<T: Pin, E: Encoding, P: Protocol> Funksteckdose<T, E, P> {
         } else {
             (Value::High, Value::Low)
         };
-        let length = code_word.len() * 2;
         for _ in 0..self.repeat_transmit {
-            debug!("Sending code: {:#X} length: {}", code, length);
             let one = P::values().one;
             let zero = P::values().zero;
             for i in (0..length).rev() {
-                let s = if code & (1 << i) != 0 { &one } else { &zero };
+                let s = if decimal_code & (1 << i) != 0 {
+                    &one
+                } else {
+                    &zero
+                };
                 self.transmit(s, &first, &second)?;
             }
             self.transmit(&P::values().sync_factor, &first, &second)?;
@@ -248,15 +383,27 @@ impl<T: Pin, E: Encoding, P: Protocol> Funksteckdose<T, E, P> {
         Ok(())
     }
 
-    fn transmit(&self, pulses: &HighLow, first: &Value, second: &Value) -> Result<(), Error> {
+    fn transmit(&mut self, pulses: &HighLow, first: &Value, second: &Value) -> Result<(), Error> {
         self.pin.set(first)?;
-        Self::delay((P::values().pulse_length * pulses.high) as u32);
+        self.delay((P::values().pulse_length * pulses.high) as u32);
         self.pin.set(second)?;
-        Self::delay((P::values().pulse_length * pulses.low) as u32);
+        self.delay((P::values().pulse_length * pulses.low) as u32);
         Ok(())
     }
 
-    fn delay(micros: u32) {
+    fn delay(&mut self, micros: u32) {
+        if micros > 0 {
+            self.delay.delay_microseconds(micros);
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+struct StdDelay {}
+
+#[cfg(feature = "std")]
+impl Delay for StdDelay {
+    fn delay_microseconds(&mut self, micros: u32) -> () {
         if micros > 0 {
             let now = std::time::Instant::now();
             let micros = u128::from(micros);
@@ -368,7 +515,6 @@ impl Protocol for Protocol5 {
     }
 }
 
-
 /// Protocol HT6P20B
 pub struct ProtocolHT6P20B;
 
@@ -424,12 +570,64 @@ pub mod wiringpi {
     }
 
     impl Pin for WiringPiPin {
-        fn set(&self, value: &Value) -> Result<(), Error> {
+        fn set(&mut self, value: &Value) -> Result<(), Error> {
             match value {
                 Value::High => self.pin.digital_write(wiringpi::pin::Value::High),
                 Value::Low => self.pin.digital_write(wiringpi::pin::Value::Low),
             }
             Ok(())
         }
+    }
+}
+
+/// Trait implementations for embedded_hal traits.
+///
+/// This allows &mut [`embedded_hal::digital::v2::OutputPin`] to be used as [`Pin`]
+/// and &mut [`embedded_hal::blocking::delay::DelayUs<u32>`] to be used as [`Delay`].
+#[cfg(feature = "embedded-hal")]
+pub mod embeddedhal {
+    use super::{Delay, Error, Pin, Value};
+
+    impl<T, E> Pin for &mut T
+    where
+        T: embedded_hal::digital::v2::OutputPin<Error = E>,
+    {
+        fn set(&mut self, value: &Value) -> Result<(), Error> {
+            match value {
+                Value::High => self.set_high().map_err(|_| Error::GpioError),
+                Value::Low => self.set_low().map_err(|_| Error::GpioError),
+            }
+        }
+    }
+
+    impl<T> Delay for &mut T
+    where
+        T: embedded_hal::blocking::delay::DelayUs<u32>,
+    {
+        fn delay_microseconds(&mut self, us: u32) -> () {
+            self.delay_us(us)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_encoding_a() {
+        let mut buf = [0u8; 32];
+
+        let group = "10001";
+        let device = &Device::D;
+        let state = &State::Off;
+        let e = EncodingA::encode(&mut buf, group, device, state).unwrap();
+        let code_decimal = tri_state_to_decimal_code(e);
+        assert_eq!(code_decimal, 1381652);
+
+        let state = &State::On;
+        let e = EncodingA::encode(&mut buf, group, device, state).unwrap();
+        let code_decimal = tri_state_to_decimal_code(e);
+        assert_eq!(code_decimal, 1381649);
     }
 }

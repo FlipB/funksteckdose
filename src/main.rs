@@ -1,3 +1,4 @@
+#![cfg_attr(not(feature = "std"), no_std)]
 /// Copyright © 2019 Felix Obenhuber
 ///
 /// Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -18,9 +19,9 @@
 /// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 /// SOFTWARE.
 
-#[cfg(not(target_os = "arm-unknown-linux-gnueabihf"))]
+#[cfg(not(all(target_os = "arm-unknown-linux-gnueabihf", cfg("wiringpi"))))]
 fn main() {
-    println!("nop - sorry, this examples requires wiringpi...");
+    // nop - sorry, this examples requires wiringpi...
 }
 
 #[cfg(all(target_os = "arm-unknown-linux-gnueabihf", cfg("wiringpi")))]
@@ -52,5 +53,6 @@ fn main() {
     type Funksteckdose = funksteckdose::Funksteckdose<WiringPiPin, EncodingA, Protocol1>;
     let pin = WiringPiPin::new(opt.pin.unwrap_or(0));
     let d: Funksteckdose = Funksteckdose::new(pin);
-    d.send(&opt.group, &opt.device, &opt.send).expect("Failed to send");
+    d.send(&opt.group, &opt.device, &opt.send)
+        .expect("Failed to send");
 }
