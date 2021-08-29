@@ -171,8 +171,18 @@ fn binary_string_to_tri_state<'a>(buf: &'a mut [u8], bits: impl Iterator<Item = 
     &buf[..n]
 }
 
+/// Converts the tri-state binary representation into bit string representation.
+fn tri_state_to_binary_string<'a>(buf: &'a [u8]) -> impl Iterator<Item = char> + 'a {
+    buf.iter().map(|b| match b {
+        b'F' => '0',
+        b'0' => '1',
+        _ => unreachable!(),
+    })
+}
+
 /// Converts the tri-state binary representation into a 64bit decimal code word.
-fn tri_state_to_decimal_code(code_word: &[u8]) -> u64 {
+pub fn tri_state_to_decimal_code(code_word: &[u8]) -> u64 {
+    // Byte slice starts with MSB
     code_word.iter().fold(0u64, |mut code, c| {
         code <<= 2u64;
         match c {
@@ -185,8 +195,30 @@ fn tri_state_to_decimal_code(code_word: &[u8]) -> u64 {
     })
 }
 
+fn decimal_code_to_tri_state<'a>(buf: &'a mut [u8], decimal_code: u64, length: usize) -> &'a [u8] {
+    let length = if length % 2 != 0 { length + 1 } else { length };
+    // Byte slice should start with MSB
+    buf.iter_mut()
+        .take(length / 2)
+        .rfold(decimal_code, |mut code, b| {
+            // LSB to MSB
+            let twobits: u8 = (code & 0b11) as u8;
+            *b = match twobits {
+                0b00 => b'0',
+                0b01 => b'F',
+                0b11 => b'1',
+                _ => unreachable!(),
+            };
+            code >>= 2u64;
+            code
+        });
+
+    &buf[0..length / 2]
+}
+
 /// Encoding
 pub trait Encoding {
+    /// encode the group/device/state command to a tristate byte slice
     fn encode<'a>(
         buf: &'a mut [u8],
         group: &str,
@@ -234,12 +266,40 @@ pub struct EncodingB;
 
 impl Encoding for EncodingB {
     fn encode<'a>(
-        _buf: &'a mut [u8],
-        _group: &str,
-        _device: &Device,
-        _state: &State,
+        buf: &'a mut [u8],
+        group: &str,
+        device: &Device,
+        state: &State,
     ) -> Result<&'a [u8], Error> {
-        unimplemented!()
+        // group, aka. addressCode int in rc-switch.
+        // addressCode 1 == group "0" == binary string "1000" == tri-state string "0FFF"
+        let group = match group {
+            "A" | "a" | "0" => "1000",
+            "B" | "b" | "1" => "0100",
+            "C" | "c" | "2" => "0010",
+            "D" | "d" | "3" => "0001",
+            "1000" | "0100" | "0010" | "0001" => group,
+            _ => return Err(Error::InvalidGroup(group.into())),
+        };
+
+        let chars = group.chars();
+
+        let device = match device {
+            Device::A => "1000",
+            Device::B => "0100",
+            Device::C => "0010",
+            Device::D => "0001",
+            Device::E => return Err(Error::InvalidDevice("E".into())),
+        };
+
+        let chars = chars.chain(device.chars());
+
+        let chars = match *state {
+            State::On => chars.chain("0000".chars()),
+            State::Off => chars.chain("0001".chars()),
+        };
+
+        Ok(binary_string_to_tri_state(buf, chars))
     }
 }
 
@@ -629,5 +689,72 @@ mod tests {
         let e = EncodingA::encode(&mut buf, group, device, state).unwrap();
         let code_decimal = tri_state_to_decimal_code(e);
         assert_eq!(code_decimal, 1381649);
+    }
+
+    #[test]
+    fn test_encoding_b() {
+        let mut buf = [0u8; 32];
+        // Device string is 0 indexed so lets do the same for group.
+        // Device "0" == Device "A" == Device 1u8
+        // Group "0" == Group "A" == Group 1u8
+        let group = "3"; // group 4
+        let device = &Device::D; // device 4
+        let state = &State::Off;
+        let e = EncodingB::encode(&mut buf, group, device, state).unwrap();
+        let code_decimal = tri_state_to_decimal_code(e);
+        assert_eq!(code_decimal, 5526612);
+
+        let state = &State::On;
+        let e = EncodingB::encode(&mut buf, group, device, state).unwrap();
+        let code_decimal = tri_state_to_decimal_code(e);
+        assert_eq!(code_decimal, 5526613);
+    }
+
+    #[test]
+    fn test_binary_string_tofrom_tri_state() {
+        let input = "000100010000";
+        let mut buf = [0u8; 32];
+
+        let tristate = binary_string_to_tri_state(&mut buf, input.chars());
+        assert_eq!(
+            &[70u8, 70, 70, 48, 70, 70, 70, 48, 70, 70, 70, 70],
+            tristate
+        );
+        let bits = tri_state_to_binary_string(tristate);
+
+        assert_eq!(input, bits.collect::<String>());
+    }
+
+    #[test]
+    fn test_tri_state_tofrom_decimal_code() {
+        // Encoding A
+        let input = &[48, 70, 70, 70, 48, 70, 70, 70, 48, 70, 70, 48];
+        let decimal_code = tri_state_to_decimal_code(input);
+        assert_eq!(1381652, decimal_code);
+        let mut buf = [0u8; 32];
+        let tristate = decimal_code_to_tri_state(&mut buf, decimal_code, 24);
+        assert_eq!(input, tristate);
+
+        let input = &[48u8, 70, 70, 70, 48, 70, 70, 70, 48, 70, 48, 70];
+        let decimal_code = tri_state_to_decimal_code(input);
+        assert_eq!(1381649, decimal_code);
+        let mut buf = [0u8; 32];
+        let tristate = decimal_code_to_tri_state(&mut buf, decimal_code, 24);
+        assert_eq!(input, tristate);
+
+        // Encoding B
+        let input = &[70u8, 70, 70, 48, 70, 70, 70, 48, 70, 70, 70, 70];
+        let decimal_code = tri_state_to_decimal_code(input);
+        assert_eq!(5526613, decimal_code);
+        let mut buf = [0u8; 32];
+        let tristate = decimal_code_to_tri_state(&mut buf, decimal_code, 24);
+        assert_eq!(input, tristate);
+
+        let input = &[70u8, 70, 70, 48, 70, 70, 70, 48, 70, 70, 70, 48];
+        let decimal_code = tri_state_to_decimal_code(input);
+        assert_eq!(5526612, decimal_code);
+        let mut buf = [0u8; 32];
+        let tristate = decimal_code_to_tri_state(&mut buf, decimal_code, 24);
+        assert_eq!(input, tristate);
     }
 }
