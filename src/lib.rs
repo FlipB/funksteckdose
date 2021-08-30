@@ -324,7 +324,7 @@ pub trait Pin {
 
 /// Interface for delay to enable no_std
 pub trait Delay {
-    /// blocks the caller for `micros` microseconds
+    /// blocks the caller for `us` microseconds
     fn delay_microseconds(&mut self, us: u32) -> ();
 }
 
@@ -397,9 +397,8 @@ impl<T: Pin, D: Delay, E: Encoding, P: Protocol> Funksteckdose<T, D, E, P> {
     /// d.send("10001", &Device::A, &State::On).expect("Failed to send");
     /// ```
     pub fn send(&mut self, group: &str, device: &Device, state: &State) -> Result<(), Error> {
-        // Get the code word for this group/device/state.
-        // This is equivalent of getCodeWordA/B/C/D in rc-switch for implemented devices.
-        let mut buf = [0; 64];
+        // Get the code word for this group/device/state using encoding `E`.
+        let mut buf = [0; 32];
         let code_word = { E::encode(&mut buf, group, device, state)? };
 
         let code = tri_state_to_decimal_code(code_word);
@@ -407,7 +406,7 @@ impl<T: Pin, D: Delay, E: Encoding, P: Protocol> Funksteckdose<T, D, E, P> {
         Ok(())
     }
 
-    /// send_decimal  is equivalent to one of the rc-switch send() implementations.
+    /// send_decimal is equivalent to one of the rc-switch send() implementations.
     /// send_decimal sends rc-switch decimal code.
     /// ```
     /// type Funksteckdose = funksteckdose::Funksteckdose<WiringPiPin, EncodingA, Protocol1>;
@@ -648,10 +647,7 @@ pub mod wiringpi {
 pub mod embeddedhal {
     use super::{Delay, Error, Pin, Value};
 
-    impl<T, E> Pin for &mut T
-    where
-        T: embedded_hal::digital::v2::OutputPin<Error = E>,
-    {
+    impl<T: embedded_hal::digital::v2::OutputPin<Error = E>, E> Pin for &mut T {
         fn set(&mut self, value: &Value) -> Result<(), Error> {
             match value {
                 Value::High => self.set_high().map_err(|_| Error::GpioError),
@@ -660,10 +656,7 @@ pub mod embeddedhal {
         }
     }
 
-    impl<T> Delay for &mut T
-    where
-        T: embedded_hal::blocking::delay::DelayUs<u32>,
-    {
+    impl<T: embedded_hal::blocking::delay::DelayUs<u32>> Delay for &mut T {
         fn delay_microseconds(&mut self, us: u32) -> () {
             self.delay_us(us)
         }
